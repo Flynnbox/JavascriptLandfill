@@ -17,7 +17,8 @@
 			rep = {
 				initialized: initializedDeferred.promise(),
 				getOrder: getOrder,
-				getLocalOrder: lookupOrder,
+				loadCurrentOrderIfAvailable: loadCurrentOrderIfAvailable,
+				loadOrderByOrderId: loadOrderByOrderId,
 				refreshOfflineData: refreshOfflineData,
 				setHideHelp: setHideHelp,
 				setHideSwipeHelp: setHideSwipeHelp,
@@ -82,15 +83,19 @@
 
 				return cache.data.CurrentOrderId.get();
 			})
-			.then(lookupOrder)
+			.then(loadOrderByOrderId)
 			.then(function(order){
 				if (order) {
 					app.log("order data found in cache for order id: " + order.orderDetail.orderId);
-					setCurrentOrder(order);
-				} else {
-					app.warn("order data was not found in cache for order");
+					return setCurrentOrder(order);
 				}
 
+				app.warn("order data was not found in cache for order");
+				var dfd = deferred();
+				dfd.resolve();
+				return dfd.promise();
+			})
+			.then(function() {
 				app.log("repository.js initialized");
 				initializedDeferred.resolve();
 			})
@@ -110,7 +115,7 @@
 	//returns right now observable array
 	function getRightNow() {
 		return rightnow;
-	};
+	}
 
 	//return new announcementCount computed observable
 	function getNewAnnouncementCount() {
@@ -141,7 +146,7 @@
 
 		rightNowInterval = setInterval(function () { app.Common.defer(updateNowCollection) }, rightNowPollingFrequency);
 		app.log('started the right now polling');
-	};
+	}
 
 	//determines the sessions to consider as Right Now sessions
 	function updateNowCollection() {
@@ -301,7 +306,6 @@
 				app.cache.data.CurrentOrder.announcements = response.payload;
 				//force the current announcements collection to refresh
 				refreshCurrentAnnouncementsFromOrder(app.cache.data.CurrentOrder);
-				cache.updateEvent(app.cache.data.CurrentOrder);
 
 				app.main.dataPollingDx.announcementsUpdated(moment());
 			}
@@ -316,7 +320,6 @@
 		.done(function (response) {
 			//update the materials collection in the current event
 			app.cache.data.CurrentOrder.materials = response.payload;
-			cache.updateEvent(app.cache.data.CurrentOrder);
 			app.main.dataPollingDx.materialsUpdated(moment());
 		})
 		.fail(function (hxr) {
@@ -329,7 +332,6 @@
 		.done(function (response) {
 			//update the resources collection in the current event
 			app.cache.data.CurrentOrder.resources = response.payload;
-			cache.updateEvent(app.cache.data.CurrentOrder);
 			app.main.dataPollingDx.resourcesUpdated(moment());
 		})
 		.fail(function () {
@@ -345,7 +347,6 @@
 			app.cache.data.CurrentOrder.orderDetail.userSessionIds = response.payload.userSessionIds;
 			app.cache.data.CurrentOrder.orderDetail.enrollmentId = response.payload.enrollmentId;
 			app.cache.data.CurrentOrder.orderDetail.serverTimestamp = response.payload.serverTimestamp;
-			cache.updateEvent(app.cache.data.CurrentOrder);
 			app.main.dataPollingDx.orderSessionsUpdated(moment());
 		})
 		.fail(function () {
@@ -358,7 +359,6 @@
 		.done(function (response) {
 			//update features collection
 			app.cache.data.CurrentOrder.features = response.payload;
-			cache.updateEvent(app.cache.data.CurrentOrder);
 			app.main.dataPollingDx.featuresUpdated(moment());
 			amplify.publish(app.events.dataUpdates.features);
 		})
@@ -487,7 +487,6 @@
 
 			//update local copy and cache
 			app.cache.data.CurrentOrder.tweets = tweets;
-			cache.updateEvent(app.cache.data.CurrentOrder);
 			app.main.dataPollingDx.tweetsUpdated(moment());
 			updateTopTweetFromOrder();//keep the tweet list and top tweet in sync
 		})
@@ -700,14 +699,13 @@
 
 	function getNotesData() {
 
-		if (app.cache.data.CurrentOrder === undefined) {
-			var dfd = deferred();
-			dfd.resolve(getDefaultNotes());
-			return dfd.promise();
+		if (app.cache.data.CurrentOrder) {
+			return cache.data.CurrentOrderNotes.get();
 		}
-
-		return cache.data.CurrentOrderNotes.get();
-	};
+		var dfd = deferred();
+		dfd.resolve(getDefaultNotes());
+		return dfd.promise();
+	}
 
 	function updateNotesLastSuccessfulUpload(updatedDate, notesData) {
 		notesData.lastSuccessfulUpload = updatedDate;
@@ -796,77 +794,6 @@
 		});
 		return dfd.promise();
 	};
-	
-	//need to make sure a cached order has correct structure
-	// - learningTypes added for 2014 Forum
-	//check for other required changes as they are implemented in api
-	function ensureOrderStructureCorrect(order) {
-		if (!order.offeringEvent.hasOwnProperty('learningTypes')) {
-			order.offeringEvent.learningTypes = [];
-		}
-		return order;
-	}
-
-	function getOrder(orderId) {
-
-		var dfd = deferred();
-
-		lookupOrder(orderId)
-			.then(function(order) {
-				if (order !== null) {
-					dfd.resolve(order);//cached order
-				}
-				else {
-					//call service api
-					serviceApi.getOrder(orderId)
-						.done(function (response) {
-							var order = response.payload;
-							try {
-								addOrderToStores(order);
-							}
-							catch (e) {
-								dfd.fail(e, "addOrderToStores:failed when adding order to stores for order " + orderId, "repository.js");
-							}
-							dfd.resolve(order);
-						})
-						.fail(function (xhr) {
-							app.error.log(null, "getOrder:failed when calling serviceApi.getOrder for order " + orderId, "repository.js");
-							dfd.reject(xhr);
-						})
-						.progress(function (progressState) {
-							dfd.notify(progressState);
-						});
-				}
-			});
-		return dfd.promise();
-	}
-
-	function refreshOrder(orderId) {
-		var dfd = deferred();
-
-		serviceApi.getOrder(orderId)
-		.done(function (response) {
-			var order = response.payload;
-			dfd.resolve(order);
-
-			//update local copy of notes from server copy of notes
-			updateNotesForExistingOrder(order);
-
-			//update local copy of order and cache
-			app.cache.data.CurrentOrder = order;
-			amplify.publish(app.events.appState.orderHasChanged, order);
-			buildUserSessionsCollection(order);
-			cache.updateEvent(app.cache.data.CurrentOrder);
-			setDataDxValues(order);
-		})
-		.fail(function (xhr) {
-			dfd.reject(xhr);
-		})
-		.progress(function (progressState) {
-			dfd.notify(progressState);
-		});
-		return dfd.promise();
-	}
 
 	function updateNotesForExistingOrder(order) {
 
@@ -944,44 +871,146 @@
 		}
 	}
 
-	function lookupOrder(orderId) {
-		orderId = parseInt(orderId);
-		return cache.data.Events.get()
-			.then(function(events) {
-				var order = $.grep(events, function (ev) { return ev.orderDetail.orderId === orderId; })[0] || null;
+	function getOrder(orderId) {
+		var dfd = deferred();
+
+		loadOrderByOrderId(orderId)
+			.then(function (order) {
 				if (order !== null) {
-					order = ensureOrderStructureCorrect(order);
+					//cached order
+					cache.updateEvent(order).then(function() {
+						dfd.resolve(order);
+					});
 				}
-				return order;
+				else {
+					//call service api
+					serviceApi.getOrder(orderId)
+						.done(function (response) {
+							var order = response.payload;
+							addOrderToStores(order).then(function() {
+								dfd.resolve(order);
+							});
+						})
+						.fail(function (xhr) {
+							app.error.log(null, "getOrder:failed when calling serviceApi.getOrder for order " + orderId, "repository.js");
+							dfd.reject(xhr);
+						})
+						.progress(function (progressState) {
+							dfd.notify(progressState);
+						});
+				}
+			});
+		return dfd.promise();
+	}
+
+	function refreshOrder(orderId) {
+		var dfd = deferred();
+
+		serviceApi.getOrder(orderId)
+		.done(function (response) {
+			var order = response.payload;
+			dfd.resolve(order);
+
+			//update local copy of notes from server copy of notes
+			updateNotesForExistingOrder(order);
+
+			//update local copy of order and cache
+				app.cache.setOrder(order)
+				.then(function() {
+					amplify.publish(app.events.appState.orderHasChanged, order);
+					buildUserSessionsCollection(order);
+					cache.updateEvent(order);
+					setDataDxValues(order);
+				});
+		})
+		.fail(function (xhr) {
+			dfd.reject(xhr);
+		})
+		.progress(function (progressState) {
+			dfd.notify(progressState);
+		});
+		return dfd.promise();
+	}
+
+	function loadOrderByOrderId(orderId) {
+		if (typeof orderId === "undefined" || orderId === null || Number.isNaN(orderId)) {
+			app.warn("Cannot load order by order id when order id is not a number, returning null order");
+			var dfd = deferred();
+			dfd.resolve(null);
+			return dfd.promise();
+		}
+
+		orderId = parseInt(orderId);
+		var oldOrderId = null;
+
+		//get the current order Id
+		return cache.data.CurrentOrderId.get()
+			.then(function(currentOrderId) {
+				oldOrderId = currentOrderId;
+
+				//update current order id if it has changed
+				if (oldOrderId !== orderId) {
+					return cache.data.CurrentOrderId.set(orderId);
+				}
+				return orderId;
 			})
-			.fail(function(error) {
-				app.error.log(error, "lookupOrder:failed to lookup order " + orderId, "repository.js");
+		.then(cache.data.PersistedOrder.get)
+		.fail(function(error) {
+			app.error.log(error, "loadOrderByOrderId:failed to lookup order " + orderId, "repository.js");
+			//reset the older order id
+			if (oldOrderId && (oldOrderId !== orderId)) {
+				cache.data.CurrentOrderId.set(oldOrderId);
+			}
+		});
+	}
+
+	function loadCurrentOrderIfAvailable() {
+		//return current order if available
+		if (app.cache.data.CurrentOrder) {
+			var dfd = deferred();
+			dfd.resolve(app.cache.data.CurrentOrder);
+			return dfd.promise();
+		}
+
+		//get the current order Id
+		return cache.data.CurrentOrderId.get()
+			.then(cache.data.PersistedOrder.get)
+			.then(function(order) {
+				cache.data.CurrentOrder = order;
+			})
+			.fail(function (error) {
+				app.error.log(error, "loadCurrentOrderIfAvailable:failed to find current order", "repository.js");
 			});
 	}
 
 	function setCurrentOrder(order) {
+		var dfd = deferred();
 		if (order) {
-			app.cache.data.CurrentOrder = order;
+			cache.setOrder(order)
+			.then(function() {
+				updateTopTweetFromOrder();
 
-			cache.data.CurrentOrderId.set(order.orderDetail.orderId);
+				amplify.publish(app.events.appState.orderHasChanged, order);
 
-			updateTopTweetFromOrder();
+				refreshCurrentAnnouncementsFromOrder(order);
 
-			amplify.publish(app.events.appState.orderHasChanged, order);
+				buildUserSessionsCollection(order);
 
-			refreshCurrentAnnouncementsFromOrder(order);
+				startPolling();
 
-			buildUserSessionsCollection(order);
-
-			startPolling();
-
-			setDataDxValues(order);
+				setDataDxValues(order);
+				dfd.resolve();
+			});
 		}
 		else {
 			stopPolling();
-			cache.data.CurrentOrderId.remove();
-			app.cache.data.CurrentOrder = null;
+			cache.deleteOrder()
+			.then(cache.data.CurrentOrderId.remove)
+			.then(function() {
+				dfd.resolve();
+			});
 		}
+		return dfd.promise();
 	}
 
 	function startPolling() {
@@ -994,10 +1023,10 @@
 	//delete an order from the cache and set app state to null
 	function deleteLocalOrder(orderId) {
 		stopPolling();
-		app.cache.data.CurrentOrder = null;
+		app.cache.deleteOrder();
+		cache.data.CurrentOrderNotes.remove();
 		cache.data.CurrentOrderId.remove();
 		cache.deleteEvent(orderId);
-		cache.data.CurrentOrderNotes.remove();
 	}
 
 	function setDataDxValues(order) {
@@ -1045,16 +1074,26 @@
 	}
 
 	function addOrderToStores(order) {
-		var notesFromServer = order.orderDetail.userSessionNotes.notes;
-		cache.addEvent(order); //persist order to ls
-
-		var orderNotes = transformNotesFromServer(notesFromServer, order.offeringEvent.sessions);
-		cache.data.CurrentOrderNotes.set(orderNotes);
+		try {
+			var notesFromServer = order.orderDetail.userSessionNotes.notes;
+			var orderNotes = transformNotesFromServer(notesFromServer, order.offeringEvent.sessions);
+			return cache.addEvent(order)
+				.then(function() {
+					return cache.data.CurrentOrderNotes.set(orderNotes);
+				});
+		}
+		catch (e) {
+			var dfd = deferred();
+			dfd.reject(e, "addOrderToStores:failed when adding order to stores for order", "repository.js");
+			return dfd.promise();
+		}
 	}
 
 	//wrap server notes in orderNotes object
 	function transformNotesFromServer(notes, sessions) {
-
+		if (notes === null) {
+			return { lastSuccessfulUpload: new Date('12/31/1900'), notes: [] }	
+		}
 		var notesWithTitles = addSessionTitlesToNotes(notes, sessions);
 		var orderNotes = { lastSuccessfulUpload: new Date(), notes: notesWithTitles };
 		return orderNotes;
@@ -1074,15 +1113,6 @@
 		var dfd = new deferred();
 		return dfd.promise();
 	}
-
-	//helper function to load collection 
-	function loadObsCollection(collectionToPopulate, data) {
-		collectionToPopulate.removeAll();
-		for (var item in data) {
-			collectionToPopulate.push(data[item]);
-		}
-	}
-
 })(jQuery.Deferred, app.cache, app.serviceApi, app.eventsMobileSettings);
 
 

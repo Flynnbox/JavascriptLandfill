@@ -119,26 +119,41 @@
 
 				    // Create a FileWriter object for our FileEntry
 				    fileEntry.createWriter(function(fileWriter) {
+						    var fileResized = false;
 
-						    fileWriter.onwrite = function(event) {
-							    app.log("File Write Succeeded");
-							    dfd.resolve(dataBlob);
+						    fileWriter.onwrite = function () {
+									//only resolve promise once the file has been resized to new data length
+							    if (fileResized) {
+								    app.log("File Write Succeeded");
+								    dfd.resolve(dataBlob);
+							    }
 						    };
 
-						    fileWriter.onerror = function(e) {
+						    fileWriter.onwriteend = function () {
+						    	//IMPORTANT: file writer only overwrites that portion of data in the file
+									//which includes the newly written data - need to truncate any remainder of prior data
+						    	if (fileResized) {
+								    return;
+						    	}
+						    	fileResized = true;
+						    	this.truncate(this.position);
+						    	app.log("File Truncation to New Data Length Succeeded");
+						    };
+
+						    fileWriter.onerror = function(error) {
 							    app.log("File Write Failed");
-							    onFileError(e, "writeFileEntry:failed on write of data");
-							    dfd.reject(e);
+							    onFileError(error, "writeFileEntry:failed on write of data");
+							    dfd.reject(error);
 						    };
 
 						    // If data object is not passed in, create a new empty Blob.
 						    if (!fileBlob) {
-							    app.log("File Write Warning - no file data exists - creating empty file");
+							    app.warn("File Write - no file data exists - creating empty file");
 							    fileBlob = new Blob([''], { type: 'text/plain' });
 						    }
 
 						    if (!(fileBlob instanceof Blob)) {
-							    app.log("File Write Warning - file data is not a Blob - converting to Blob text/plain");
+							    app.warn("File Write - file data is not a Blob - converting to Blob text/plain");
 							    fileBlob = new Blob([JSON.stringify(fileBlob)], { type: 'text/plain' });
 						    }
 						    fileWriter.write(fileBlob);
@@ -152,7 +167,7 @@
 		    return dfd.promise();
 	    },
 
-	    write = function(fileName, data) {
+	    write = function (fileName, data) {
 		    return getFileSystem()
 			    .then(function(fileSystem) {
 				    return getFile(fileSystem, fileName);
@@ -172,15 +187,20 @@
 					    var reader = new FileReader();
 
 					    reader.onload = function() {
-						    app.log("File Read Succeeded");
+					    	app.log("File Read Succeeded");
+
+					    	if ((typeof defaultValue !== "undefined") && (reader.result === null || reader.result.length === 0)) {
+							    app.warn("File contents are zero-length string; using default value");
+							    dfd.resolve(defaultValue);
+							    return;
+						    }
 
 						    try {
 							    var result = tryParseJSON(reader.result);
 							    dfd.resolve(result.json || defaultValue, fileEntry);
 						    } catch (error) {
-							    var e = SyntaxError("Could not parse to JSON file " + fileEntry.fullPath.toString());
-							    onFileError(e, "readFileEntry:failed on read of data");
-							    dfd.reject(e);
+							    onFileError(error, "readFileEntry:Failed to parse JSON file " + fileEntry.fullPath.toString());
+							    dfd.reject(error);
 						    }
 					    };
 
@@ -200,7 +220,7 @@
 		    return dfd.promise();
 	    },
 
-	    read = function(fileName, defaultValue) {
+	    read = function (fileName, defaultValue) {
 		    return getFileSystem()
 			    .then(function(fileSystem) {
 				    return getFile(fileSystem, fileName);

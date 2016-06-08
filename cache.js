@@ -6,20 +6,23 @@
 			cache = {
 				initialized: initializedDeferred.promise(),
 				addEvent: addEvent,
-				saveToCache: persistToStore,
-				clearOfflineCache: clearOfflineCache,
-				resetHelpTips: resetHelpVisibility,
 				updateEvent: updateEvent,
 				deleteEvent: deleteEvent,
+				clearOfflineCache: clearOfflineCache,
+				resetHelpTips: resetHelpVisibility,
+				setOrder: setOrder,
+				deleteOrder: deleteOrder,
 				data: {
+					CurrentOrderId: cacheWithBackupStore(bindToDataStore("CURRENTORDERID", localStore)),
 					CurrentOrder: null,
-					CurrentOrder2: cacheWithBackupStore(() => {
-						return 'ORDER_' + app.cache.data.CurrentOrder.orderDetail.orderId;
-					}, fileStore),
-					CurrentOrderId: bindToDataStore("CURRENTORDERID", localStore),
-					CurrentOrderNotes: bindToDataStoreWithDynamicKey(() => {
-						return 'NOTESDATA_' + app.cache.data.CurrentOrder.orderDetail.orderId;
-					}, localStore, { lastSuccessfulUpload: new Date('12/31/1900'), notes: [] }),
+					PersistedOrder: bindToDataStoreWithPromiseKey(() => {
+						return app.cache.data.CurrentOrderId.get()
+							.then(orderId => 'ORDER_' + orderId, error => onCacheError(error, "failed to get key value from promise for PersistedOrder"));
+					}, fileStore, null),
+					CurrentOrderNotes: bindToDataStoreWithPromiseKey(() => {
+						return app.cache.data.CurrentOrderId.get()
+							.then(orderId => 'NOTESDATA_' + orderId, error => onCacheError(error, "failed to get key value from promise for CurrentOrderNotes"));
+					}, fileStore, { lastSuccessfulUpload: new Date('12/31/1900'), notes: [] }),
 					Events: bindToDataStore("EVENTS", fileStore, []),
 					Events_DEPRECATED: bindToDataStore("EVENTS", localStore, []),
 					LastRefresh: bindToDataStore("LASTREFRESH", localStore),
@@ -40,13 +43,17 @@
 
 	return cache; // done with setup; return module variable
 
+	function onCacheError(error, message) {
+		app.error.log(error, "onCacheError:" + message, "cache.js");
+	}
+
 	function bindToDataStore(dataKey, dataStore, defaultValue) {
 		return {
 			key: dataKey,
 			get: (typeof defaultValue !== 'undefined') ? dataStore.get.bind(undefined, dataKey, defaultValue) : dataStore.get.bind(undefined, dataKey),
 			set: dataStore.set.bind(undefined, dataKey),
 			remove: dataStore.remove.bind(undefined, dataKey),
-			dataStore: dataStore.type
+			type: dataStore.type
 		};
 	}
 
@@ -54,44 +61,73 @@
 		return {
 			key: keyFunction,
 			get: function() {
-				return (typeof defaultValue !== 'undefined') ? dataStore.get(this.key(), defaultValue) : dataStore.get(this.key());
+				return (typeof defaultValue !== 'undefined') ? dataStore.get(keyFunction(), defaultValue) : dataStore.get(keyFunction());
 			},
 			set: function(value) {
-				return dataStore.set(this.key(), value);
+				return dataStore.set(keyFunction(), value);
 			},
 			remove: function () {
-				return dataStore.remove(this.key());
+				return dataStore.remove(keyFunction());
 			},
-			dataStore: dataStore.type
+			type: dataStore.type
+		};
+	}
+
+	function bindToDataStoreWithPromiseKey(keyPromise, dataStore, defaultValue) {
+		return {
+			key: keyPromise,
+			get: function () {
+				if (typeof defaultValue !== 'undefined') {
+					return keyPromise()
+						.then(function(keyValue) {
+							return dataStore.get(keyValue, defaultValue);
+						})
+						.fail(error => onCacheError(error, "bindToDataStoreWithPromiseKey:failed to get key value from promise"));
+				} else {
+					return keyPromise()
+						.then(dataStore.get)
+						.fail(error => onCacheError(error, "bindToDataStoreWithPromiseKey:failed to get key value from promise"));
+				}
+			},
+			set: function (value) {
+				return keyPromise().then(keyValue => dataStore.set(keyValue, value), error => onCacheError(error, "bindToDataStoreWithPromiseKey:failed to get key value from promise"));
+			},
+			remove: function () {
+				return keyPromise().then(keyValue => dataStore.remove(keyValue), error => onCacheError(error, "bindToDataStoreWithPromiseKey:failed to get key value from promise"));
+			},
+			type: dataStore.type
 		};
 	}
 
 	//creates an in-memory object synced to a data store
-	function cacheWithBackupStore(keyOrKeyFunction, configuredStore) {
-		var value = null,
-		    isKeyFunction = $.isFunction(keyOrKeyFunction);
+	function cacheWithBackupStore(configuredStore) {
+		var value = null;
 
 		return {
-			key: function() {
-				return isKeyFunction ? keyOrKeyFunction() : keyOrKeyFunction;
-			},
+			key: configuredStore.key,
 			get: function () {
 				if (value) {
 					var dfd = deferred();
 					dfd.resolve(value);
 					return dfd.promise();
 				}
-				return configuredStore.get(this.key()).then(newValue => value = newValue);
+				return configuredStore.get().then(newValue => value = newValue);
 			},
 			set: function (newValue) {
 				value = newValue;
-				return configuredStore.set(this.key(), value);
+				return configuredStore.set(value);
 			},
 			remove: function () {
 				value = null;
-				return configuredStore.remove(this.key());
+				return configuredStore.remove();
 			},
-			dataStore: configuredStore.type
+			clearCache: function () {
+				var dfd = deferred();
+				value = null;
+				dfd.resolve();
+				return dfd.promise();
+			},
+			type: configuredStore.type
 		};
 	}
 
@@ -115,33 +151,58 @@
 		cache.data.Events.remove();
 	};
 
+	//IMPORTANT: Ensure that CurrentOrder and PersistedOrder remain in sync
+	function setOrder(order) {
+		app.log("setting current & persistent order");
+		return cache.data.PersistedOrder.set(order)
+			.then(function() {
+				app.cache.data.CurrentOrder = order;
+			});
+	}
+
+	//IMPORTANT: Ensure that CurrentOrder and PersistedOrder remain in sync
+	function deleteOrder() {
+		app.log("deleting current & persistent order");
+		return cache.data.PersistedOrder.remove()
+			.then(function () {
+				app.cache.data.CurrentOrder = null;
+			});
+	}
+
+	function projectOrderToEventListItem(order) {
+		return {
+			orderId: order.orderDetail.orderId,
+			eventTitle: order.offeringEvent.title,
+			eventCode: order.offeringEvent.code,
+			attendeeName: order.orderDetail.fullName
+		};
+	}
+
 	function addEvent(order) {
-		//clear notes before storing to ls - notes stored separately from order
-		order.orderDetail.userSessionNotes.notes = [];
+		var event = projectOrderToEventListItem(order);
 
 		return cache.data.Events.get()
 			.then(function (events) {
-				events.push(order);
+				events.push(event);
 				return cache.data.Events.set(events);
 			})
 			.fail(function (error) {
-				app.error.log(error, "addEvent:failed to insert order " + orderId + " into cache", "cache.js");
+				onCacheError(error, "addEvent:failed to insert order " + order.orderId + " into cache");
 			});
 	};
 
 	function updateEvent(order) {
-		//clear notes before storing to ls- notes stored separately from order
-		order.orderDetail.userSessionNotes.notes = [];
+		var event = projectOrderToEventListItem(order);
 
 		return cache.data.Events.get()
 			.then(function (events) {
 				//remove the event from the array
-				var theOtherEvents = $.grep(events, function (item) { return item.orderDetail.orderId !== order.orderDetail.orderId; });
-				theOtherEvents.push(order);
+				var theOtherEvents = $.grep(events, function (item) { return item.orderId !== event.orderId; });
+				theOtherEvents.push(event);
 				return cache.data.Events.set(theOtherEvents);
 			})
 			.fail(function (error) {
-				app.error.log(error, "updateEvent:failed to update order " + orderId + " within cache", "cache.js");
+				onCacheError(error, "updateEvent:failed to update order " + order.orderId + " within cache");
 			});
 	};
 
@@ -149,28 +210,12 @@
 		return cache.data.Events.get()
 			.then(function(events) {
 				//remove the event from the array
-				var theOtherEvents = $.grep(events, function(item) { return item.orderDetail.orderId !== orderId; });
+				var theOtherEvents = $.grep(events, function(item) { return item.orderId !== orderId; });
 				return cache.data.Events.set(theOtherEvents);
 			})
 			.fail(function(error) {
-				app.error.log(error, "deleteEvent:failed to delete order " + orderId + " from cache", "cache.js");
+				onCacheError(error, "deleteEvent:failed to delete order " + orderId + " from cache");
 			});
-	};
-
-	//save to data to storage
-	function persistToStore(key, newDataToPersist) {
-		try {
-			app.log("invoking persistToStore: refactor to replace call with cache.data.[" + key + "].set()");
-
-			amplify.store(key, newDataToPersist);
-			cache.data.LastRefresh.set(new Date());
-		}
-		catch (error) {
-			app.error.log(error, 'persistToStore: The maximum storage space may have been exceeded', 'cache.js');
-
-			//amplify.publish(app.events.appState.errorOccurred, error); //potential logic error - instead we should ask more space
-			toastr.error('The maximum storage space been exceeded. You need to delete any old events to clear up some space');
-		}
 	};
 	
 	function initializeCache() {
@@ -203,7 +248,7 @@
 				initializedDeferred.resolve();
 			})
 			.fail(function (error) {
-				app.error.log(error, "initializeCache:failed to initialize cache", "cache.js");
+				onCacheError(error, "initializeCache:failed to initialize cache");
 				initializedDeferred.reject(error);
 			});
 	};
